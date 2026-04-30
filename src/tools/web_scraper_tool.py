@@ -38,6 +38,7 @@ class WebScraperTool(BaseTool):
                     results.append(self._scrape_indiehackers(context))
                 if source in ("hackernews", "all"):
                     results.append(self._scrape_hackernews(context))
+                    results.append(self._scrape_hn_hiring(context))
                 if source in ("substack", "all"):
                     results.append(self._scrape_substack(context))
                 if source in ("producthunt", "all"):
@@ -144,6 +145,54 @@ class WebScraperTool(BaseTool):
         except Exception as e:
             return f"[HackerNews] Error: {e}"
 
+    def _scrape_hn_hiring(self, context) -> str:
+        """Scrape HN 'Who is hiring' monthly threads — rich source of real opportunities."""
+        try:
+            page = context.new_page()
+            resp = page.goto(
+                "https://news.ycombinator.com/submitted?id=whoishiring",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(2000)
+            content = page.content()
+            page.close()
+
+            soup = BeautifulSoup(content, "html.parser")
+            links = soup.select(".titleline > a")
+            threads = [a for a in links if "who is hiring" in a.get_text(strip=True).lower()][:3]
+
+            all_jobs = []
+            for thread_link in threads:
+                thread_title = thread_link.get_text(strip=True)
+                thread_url = thread_link.get("href", "")
+                # Navigate to the thread
+                page2 = context.new_page()
+                target = thread_url if thread_url.startswith("http") else f"https://news.ycombinator.com/{thread_url}"
+                resp2 = page2.goto(target, timeout=25000, wait_until="domcontentloaded")
+                page2.wait_for_timeout(3000)
+                thread_html = page2.content()
+                page2.close()
+
+                jobs = HNHiringParser.parse_job_comments(thread_html)
+                for job in jobs:
+                    job["source"] = f"HN {thread_title}"
+                    job["url"] = target
+                all_jobs.extend(jobs)
+
+            lines = []
+            for job in all_jobs[:10]:  # max 10
+                income_str = f"${job['income']}/mo" if job["income"] != "?" else "$?/mo"
+                lines.append(
+                    f"[HN Hiring] {job['title']}\n"
+                    f"  Income: {income_str} | Time: {job['time']} hrs/wk\n"
+                    f"  {job['description'][:200]}\n"
+                    f"  URL: {job['url']}"
+                )
+            return "\n\n".join(lines) if lines else "[HN Hiring] No threads found"
+        except Exception as e:
+            return f"[HN Hiring] Error: {e}"
+
     def _scrape_substack(self, context) -> str:
         """Scrape Substack's trending business/money newsletter posts."""
         try:
@@ -220,3 +269,79 @@ class WebScraperTool(BaseTool):
 
         except Exception as e:
             return f"[ProductHunt] Error: {e}"
+
+
+
+class HNHiringParser:
+    """Parse HN 'Who is hiring' monthly threads for job opportunities."""
+
+    @staticmethod
+    def extract_thread_links(html: str, max_months: int = 3) -> list[dict]:
+        """Extract hiring thread links from submitted page. Returns list of {url, title, month}."""
+        soup = BeautifulSoup(html, "html.parser")
+        links = soup.select(".titleline > a")
+        threads = []
+        for a in links:
+            text = a.get_text(strip=True)
+            if "who is hiring" in text.lower():
+                threads.append({
+                    "url": a.get("href", ""),
+                    "title": text,
+                    "month": HNHiringParser._extract_month(text),
+                })
+                if len(threads) >= max_months:
+                    break
+        return threads
+
+    @staticmethod
+    def _extract_month(title: str) -> str:
+        m = re.search(r'\(([A-Za-z]+ \d{4})\)', title)
+        return m.group(1) if m else "unknown"
+
+    @staticmethod
+    def parse_job_comments(html: str) -> list[dict]:
+        """Parse a hiring thread page for job comment entries."""
+        soup = BeautifulSoup(html, "html.parser")
+        comments = soup.select(".comment")
+        jobs = []
+        for com in comments[:30]:  # first 30 comments
+            text = com.get_text(strip=True)
+            if len(text) < 50:
+                continue
+            title = HNHiringParser._extract_job_title(text)
+            if title:
+                income = HNHiringParser._extract_salary(text)
+                jobs.append({
+                    "title": title,
+                    "income": income,
+                    "time": HNHiringParser._estimate_time(text),
+                    "startup_cost": "low" if "remote" in text.lower() else "medium",
+                    "description": text[:300],
+                    "url": "",
+                })
+        return jobs
+
+    @staticmethod
+    def _extract_job_title(text: str) -> str:
+        """First line or first 80 chars is usually the job title."""
+        lines = text.split("\n")
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10:
+                return line[:80]
+
+    @staticmethod
+    def _extract_salary(text: str) -> str:
+        """Look for salary mentions like $120k, 80-150k."""
+        m = re.search(r'[€$£](\d+)[\dk]?', text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return "?"
+
+    @staticmethod
+    def _estimate_time(text: str) -> str:
+        if "part-time" in text.lower() or "part time" in text.lower():
+            return "20"
+        if "contract" in text.lower() or "freelance" in text.lower():
+            return "10"
+        return "40"
