@@ -322,18 +322,21 @@ class HNHiringParser:
         return jobs
 
     @staticmethod
-    def _extract_job_title(text: str) -> str:
-        """First line or first 80 chars is usually the job title."""
+    def _extract_job_title(text: str) -> str | None:
+        """First line or first 80 chars is usually the job title. Returns None if all lines are ≤10 chars."""
         lines = text.split("\n")
         for line in lines:
             line = line.strip()
             if len(line) > 10:
                 return line[:80]
+        return None  # explicit fallback — caller guards with `if title:`
 
     @staticmethod
     def _extract_salary(text: str) -> str:
-        """Look for salary mentions like $120k, 80-150k."""
-        m = re.search(r'[€$£](\d+)[\dk]?', text, re.IGNORECASE)
+        """Look for salary mentions like $120k, €80/hr.
+        Note: k-suffix not supported — $50k shows as 50 (limitation, not silent data loss).
+        """
+        m = re.search(r'[€$£](\d+)', text)
         if m:
             return m.group(1)
         return "?"
