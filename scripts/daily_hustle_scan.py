@@ -215,7 +215,11 @@ def main():
 
     # 1. Fetch web
     print("Scanning web sources...")
-    web_results = run_web_scan()
+    try:
+        web_results = run_web_scan()
+    except Exception as e:
+        print(f"Web scan failed: {e}")
+        web_results = ""
 
     # 2. Parse into opportunities
     opportunities = evaluate_opportunity(web_results)
