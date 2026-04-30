@@ -94,8 +94,8 @@ def run_vault_check() -> str:
 
 def consult_council(opportunity: dict) -> dict:
     """Consult Coach with graceful degradation on failure."""
-    from ai_council.src.agents.agents import CoachPartner
     try:
+        from ai_council.src.agents.agents import CoachPartner
         coach = CoachPartner()
         prompt = f"""Evaluate this side hustle opportunity:
 
