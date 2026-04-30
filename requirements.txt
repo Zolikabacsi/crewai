@@ -1,0 +1,14 @@
+# requirements.txt - Python dependencies for CrewAI Business Evaluator
+
+# Core framework
+crewai>=0.80.0
+crewai-tools>=0.10.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Optional: For enhanced functionality
+# serpapi>=1.0.0  # For advanced web search capabilities
+
+# Redis for AgentBus message broker
+redis>=5.0.0

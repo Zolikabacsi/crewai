@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Daily side hustle scan — run via cron.
+
+Scrapes web sources, checks vault reports, consults council agents,
+routes findings to Slack.
+"""
+
+import os
+import sys
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+# Add project root to path
+WORKTREE_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(WORKTREE_ROOT))
+
+from src.tools import WebScraperTool, IndustryReportTool, OpportunityStorageTool
+from slack.slack_client import SlackClient, build_extraordinary_alert, build_daily_report
+from ai_council.src.agents.agents import CoachPartner, DevilsAdvocatePartner, CFOPartner, IntelligencePartner
+
+OPPORTUNITY_STORE = Path.home() / ".claude" / "side_hustle_opportunities.json"
+VAULT_ROOT = Path.home() / "srv" / "vault"
+
+
+def run_web_scan() -> list:
+    """Scrape web for opportunities."""
+    scraper = WebScraperTool()
+    result = scraper._run(source="all")
+    return result
+
+
+def run_vault_check() -> str:
+    """Check vault for industry trends."""
+    tool = IndustryReportTool()
+    return tool._run(query="market trend OR revenue OR demand OR opportunity")
+
+
+def consult_council(opportunity: dict) -> dict:
+    """Consult Coach + Devil's Advocate + optional others."""
+    coach = CoachPartner()
+    devil = DevilsAdvocatePartner()
+
+    prompt = f"""Evaluate this side hustle opportunity:
+
+Title: {opportunity.get('title', '?')}
+Description: {opportunity.get('description', '?')}
+Income: €{opportunity.get('scores', {}).get('income', '?')}/month
+Time: {opportunity.get('scores', {}).get('time_hrs_week', '?')} hrs/week
+Startup cost: €{opportunity.get('scores', {}).get('startup_cost', '?')}
+
+Provide a brief assessment."""
+
+    # Consult coach
+    coach_response = "Coach consultation (placeholder - LLM call)"
+    devil_response = "Devil's Advocate consultation (placeholder - LLM call)"
+
+    return {
+        "coach": coach_response,
+        "devils_advocate": devil_response,
+    }
+
+
+def evaluate_opportunity(raw_text: str) -> list:
+    """Parse scraped content into opportunity records.
+
+    Format is: "[Source] title\n  description\n  URL: ..."
+    Separated by double newlines (\n\n).
+    """
+    opportunities = []
+    # Split on double newlines (output separator from scraper)
+    sections = raw_text.split("\n\n")
+    for section in sections:
+        if not section.strip() or len(section) < 20:
+            continue
+        lines = section.strip().split("\n")
+        if len(lines) < 1:
+            continue
+
+        # First line is [Source] Title
+        first_line = lines[0]
+        source = ""
+        title = first_line
+
+        if first_line.startswith("["):
+            # Format: [SourceName] Title
+            bracket_end = first_line.find("]")
+            if bracket_end != -1:
+                source = first_line[1:bracket_end]
+                title = first_line[bracket_end + 1 :].strip()
+                # Remove leading bracket artifact
+                if title.startswith("["):
+                    title = title[1:]
+                    bracket_end2 = title.find("]")
+                    if bracket_end2 != -1:
+                        title = title[bracket_end2 + 1 :].strip()
+
+        if not title or len(title) < 5:
+            continue
+
+        description = "\n".join(lines[:3])[:300]
+
+        opp = {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "description": description,
+            "scores": {
+                "income": "?",
+                "time_hrs_week": "?",
+                "startup_cost": "low",
+                "skill_match": "medium",
+                "timing": "growing",
+            },
+            "council_feedback": {},
+            "status": "pending",
+            "discovered_date": datetime.now().strftime("%Y-%m-%d"),
+            "source": source,
+        }
+        opportunities.append(opp)
+    return opportunities
+
+
+def is_extraordinary(opp: dict) -> bool:
+    """Agent judgment: is this an extraordinary opportunity?"""
+    try:
+        income = int(str(opp.get("scores", {}).get("income", "0")).replace("?", "0").replace("€", "").replace(",", ""))
+        time_hrs = int(str(opp.get("scores", {}).get("time_hrs_week", "99")).replace("?", "99").replace("<", "").split("-")[0])
+        startup_cost_str = str(opp.get("scores", {}).get("startup_cost", "high"))
+        startup_cost = 0 if startup_cost_str.lower() in ["low", "none", "€0", "0"] else 500
+
+        # Extraordinary: high income potential + reasonable time + low startup
+        if income >= 500 and time_hrs <= 15 and startup_cost <= 200:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def save_opportunity(opp: dict) -> None:
+    """Save opportunity to JSON store."""
+    OPPORTUNITY_STORE.parent.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if OPPORTUNITY_STORE.exists():
+        try:
+            existing = json.loads(OPPORTUNITY_STORE.read_text())
+        except Exception:
+            existing = []
+    existing.append(opp)
+    OPPORTUNITY_STORE.write_text(json.dumps(existing, indent=2))
+
+
+def main():
+    print(f"=== Side Hustle Daily Scan — {datetime.now().isoformat()} ===")
+
+    # 1. Scan web
+    print("Scanning web sources...")
+    web_results = run_web_scan()
+
+    # 2. Check vault
+    print("Checking vault reports...")
+    vault_results = run_vault_check()
+
+    # 3. Parse into opportunities
+    opportunities = evaluate_opportunity(web_results)
+    print(f"Found {len(opportunities)} opportunities")
+
+    extraordinary = []
+    regular = []
+
+    for opp in opportunities:
+        # 4. Consult council
+        council = consult_council(opp)
+        opp["council_feedback"] = council
+
+        # 5. Classify
+        if is_extraordinary(opp):
+            extraordinary.append(opp)
+            print(f"  EXTRAORDINARY: {opp['title']}")
+        else:
+            regular.append(opp)
+
+        # 6. Save
+        save_opportunity(opp)
+
+    # 7. Send Slack notifications
+    print("Sending Slack notifications...")
+
+    if extraordinary:
+        for opp in extraordinary:
+            msg = build_extraordinary_alert(
+                title=opp["title"],
+                description=opp["description"][:200],
+                scores=opp["scores"],
+                coach_says=opp["council_feedback"].get("coach", ""),
+                devils_advocate=opp["council_feedback"].get("devils_advocate", ""),
+                source=opp.get("source", ""),
+            )
+            SlackClient.send(msg)
+
+    if regular:
+        report = build_daily_report(regular, datetime.now().strftime("%Y-%m-%d"))
+        SlackClient.send(report)
+    elif not extraordinary:
+        SlackClient.send(f"📊 Side Hustle Daily Report — {datetime.now().strftime('%Y-%m-%d')}\n\nNo new opportunities today.")
+
+    print("Scan complete.")
+
+
+if __name__ == "__main__":
+    main()
