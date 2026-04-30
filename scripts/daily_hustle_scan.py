@@ -9,8 +9,9 @@ import os
 import sys
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 WORKTREE_ROOT = Path(__file__).parent.parent
@@ -18,10 +19,63 @@ sys.path.insert(0, str(WORKTREE_ROOT))
 
 from src.tools import WebScraperTool, IndustryReportTool, OpportunityStorageTool
 from slack.slack_client import SlackClient, build_extraordinary_alert, build_daily_report
-from ai_council.src.agents.agents import CoachPartner, DevilsAdvocatePartner, CFOPartner, IntelligencePartner
+# ai_council imported lazily in consult_council to avoid loading crewai_tools at module level
 
 OPPORTUNITY_STORE = Path.home() / ".claude" / "side_hustle_opportunities.json"
 VAULT_ROOT = Path.home() / "srv" / "vault"
+
+DEDUP_FILE = Path.home() / ".claude" / "hustle_seen_urls.json"
+RETENTION_DAYS = 90
+
+
+class DedupTracker:
+    """Track seen URLs, skip duplicates within 90-day window."""
+
+    def __init__(self, state_file: Optional[Path] = None):
+        if state_file is None:
+            self.state_file = DEDUP_FILE
+        else:
+            state_file = Path(state_file)
+            self.state_file = state_file / "dedup.json" if state_file.is_dir() else state_file
+        self._data = self._load()
+
+    def _load(self) -> dict:
+        if self.state_file.exists():
+            try:
+                return json.loads(self.state_file.read_text())
+            except Exception:
+                pass
+        return {"seen": []}
+
+    def _save(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps(self._data, indent=2))
+
+    def is_new(self, url: str) -> bool:
+        if not url:
+            return True
+        cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
+        for entry in self._data["seen"]:
+            if entry["url"] == url and entry["seen_date"] >= cutoff:
+                return False
+        return True
+
+    def mark_seen(self, url: str):
+        if not url:
+            return
+        self._data["seen"].append({
+            "url": url,
+            "seen_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+        self._save()
+
+    def prune(self):
+        """Remove entries older than RETENTION_DAYS."""
+        cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
+        self._data["seen"] = [
+            e for e in self._data["seen"] if e["seen_date"] >= cutoff
+        ]
+        self._save()
 
 
 def run_web_scan() -> list:
@@ -39,6 +93,7 @@ def run_vault_check() -> str:
 
 def consult_council(opportunity: dict) -> dict:
     """Consult Coach + Devil's Advocate + optional others."""
+    from ai_council.src.agents.agents import CoachPartner, DevilsAdvocatePartner
     coach = CoachPartner()
     devil = DevilsAdvocatePartner()
 
