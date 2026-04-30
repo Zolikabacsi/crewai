@@ -62,3 +62,45 @@ def build_daily_report(opportunities: list, date: str) -> str:
         if coach:
             lines.append(f"   Coach: {coach[:80]}")
     return "\n".join(lines)
+
+
+from datetime import datetime
+
+def build_rich_card(
+    title: str,
+    income: str,
+    time: str,
+    summary: str,
+    source: str,
+    url: str,
+    coach: str | None,
+) -> str:
+    income_str = f"€{income}/mo" if income != "?" else "€?/mo"
+    coach_str = coach if coach else "Coach assessment unavailable — check source link"
+    return (
+        f"🎯 {title} — {income_str} | {time} hrs/wk\n"
+        f"   {summary}\n"
+        f"   Source: {source} | URL: {url}\n"
+        f"   💡 {coach_str}"
+    )
+
+
+def build_hustle_report(opportunities: list[dict], new_count: int, skip_count: int) -> str:
+    """Build the daily hustle report with rich cards."""
+    header = f"📊 Side Hustle Daily Report — {datetime.now().strftime('%Y-%m-%d')}\n"
+    header += f"Found {new_count} new opportunities ({skip_count} skipped as duplicates)\n\n"
+
+    cards = []
+    for opp in opportunities[:10]:  # max 10
+        card = build_rich_card(
+            title=opp.get("title", "?"),
+            income=opp.get("scores", {}).get("income", "?"),
+            time=opp.get("scores", {}).get("time_hrs_week", "?"),
+            summary=opp.get("summary", opp.get("description", ""))[:150],
+            source=opp.get("source", "?"),
+            url=opp.get("url", ""),
+            coach=opp.get("council_feedback", {}).get("coach"),
+        )
+        cards.append(card)
+
+    return header + "\n\n".join(f"{i+1}. {c}" for i, c in enumerate(cards))

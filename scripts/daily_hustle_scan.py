@@ -18,7 +18,8 @@ WORKTREE_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(WORKTREE_ROOT))
 
 from src.tools import WebScraperTool, IndustryReportTool, OpportunityStorageTool
-from slack.slack_client import SlackClient, build_extraordinary_alert, build_daily_report
+from src.tools.web_scraper_tool import RedditPostParser
+from slack.slack_client import SlackClient, build_extraordinary_alert, build_daily_report, build_hustle_report
 # ai_council imported lazily in consult_council to avoid loading crewai_tools at module level
 
 OPPORTUNITY_STORE = Path.home() / ".claude" / "side_hustle_opportunities.json"
@@ -92,29 +93,23 @@ def run_vault_check() -> str:
 
 
 def consult_council(opportunity: dict) -> dict:
-    """Consult Coach + Devil's Advocate + optional others."""
-    from ai_council.src.agents.agents import CoachPartner, DevilsAdvocatePartner
-    coach = CoachPartner()
-    devil = DevilsAdvocatePartner()
-
-    prompt = f"""Evaluate this side hustle opportunity:
+    """Consult Coach with graceful degradation on failure."""
+    from ai_council.src.agents.agents import CoachPartner
+    try:
+        coach = CoachPartner()
+        prompt = f"""Evaluate this side hustle opportunity:
 
 Title: {opportunity.get('title', '?')}
-Description: {opportunity.get('description', '?')}
+Description: {opportunity.get('description', '?')[:200]}
 Income: €{opportunity.get('scores', {}).get('income', '?')}/month
 Time: {opportunity.get('scores', {}).get('time_hrs_week', '?')} hrs/week
-Startup cost: €{opportunity.get('scores', {}).get('startup_cost', '?')}
+Startup cost: {opportunity.get('scores', {}).get('startup_cost', '?')}
 
-Provide a brief assessment."""
-
-    # Consult coach
-    coach_response = "Coach consultation (placeholder - LLM call)"
-    devil_response = "Devil's Advocate consultation (placeholder - LLM call)"
-
-    return {
-        "coach": coach_response,
-        "devils_advocate": devil_response,
-    }
+Provide a one-line assessment of viability and one risk to watch."""
+        coach_response = coach.evaluate(prompt)  # real LLM call
+    except Exception:
+        coach_response = None  # graceful fallback — build_rich_card handles None
+    return {"coach": coach_response, "devils_advocate": ""}
 
 
 def evaluate_opportunity(raw_text: str) -> list:
@@ -156,10 +151,20 @@ def evaluate_opportunity(raw_text: str) -> list:
 
         description = "\n".join(lines[:3])[:300]
 
+        # Extract URL from lines that contain "URL:"
+        url = ""
+        for line in lines:
+            if "URL:" in line or "url:" in line or line.startswith("http"):
+                url = line.split("URL:", 1)[-1].split("url:", 1)[-1].strip()
+                if not url and line.startswith("http"):
+                    url = line.strip()
+                break
+
         opp = {
             "id": str(uuid.uuid4()),
             "title": title,
             "description": description,
+            "url": url,
             "scores": {
                 "income": "?",
                 "time_hrs_week": "?",
@@ -208,55 +213,54 @@ def save_opportunity(opp: dict) -> None:
 def main():
     print(f"=== Side Hustle Daily Scan — {datetime.now().isoformat()} ===")
 
-    # 1. Scan web
+    # 1. Fetch web
     print("Scanning web sources...")
     web_results = run_web_scan()
 
-    # 2. Check vault
-    print("Checking vault reports...")
-    vault_results = run_vault_check()
-
-    # 3. Parse into opportunities
+    # 2. Parse into opportunities
     opportunities = evaluate_opportunity(web_results)
-    print(f"Found {len(opportunities)} opportunities")
+    print(f"Found {len(opportunities)} raw opportunities")
 
-    extraordinary = []
-    regular = []
-
+    # 3. Deduplicate
+    dedup = DedupTracker()
+    new_opportunities = []
+    skip_count = 0
     for opp in opportunities:
-        # 4. Consult council
+        url = opp.get("url", "")
+        if not url or dedup.is_new(url):
+            if url:
+                dedup.mark_seen(url)
+            new_opportunities.append(opp)
+        else:
+            skip_count += 1
+
+    # 4. Score
+    scored = []
+    for opp in new_opportunities:
+        opp["summary"] = (
+            RedditPostParser.extract_summary(opp.get("description", ""))
+            if "Reddit" in opp.get("source", "")
+            else opp.get("description", "")[:150]
+        )
+        scored.append(opp)
+
+    print(f"Found {len(scored)} new opportunities ({skip_count} skipped as duplicates)")
+
+    # 5. Consult council (graceful)
+    for opp in scored:
         council = consult_council(opp)
         opp["council_feedback"] = council
 
-        # 5. Classify
-        if is_extraordinary(opp):
-            extraordinary.append(opp)
-            print(f"  EXTRAORDINARY: {opp['title']}")
-        else:
-            regular.append(opp)
-
-        # 6. Save
+    # 6. Save
+    for opp in scored:
         save_opportunity(opp)
 
-    # 7. Send Slack notifications
+    # 7. Send Slack
     print("Sending Slack notifications...")
-
-    if extraordinary:
-        for opp in extraordinary:
-            msg = build_extraordinary_alert(
-                title=opp["title"],
-                description=opp["description"][:200],
-                scores=opp["scores"],
-                coach_says=opp["council_feedback"].get("coach", ""),
-                devils_advocate=opp["council_feedback"].get("devils_advocate", ""),
-                source=opp.get("source", ""),
-            )
-            SlackClient.send(msg)
-
-    if regular:
-        report = build_daily_report(regular, datetime.now().strftime("%Y-%m-%d"))
+    if scored:
+        report = build_hustle_report(scored, len(scored), skip_count)
         SlackClient.send(report)
-    elif not extraordinary:
+    else:
         SlackClient.send(f"📊 Side Hustle Daily Report — {datetime.now().strftime('%Y-%m-%d')}\n\nNo new opportunities today.")
 
     print("Scan complete.")
