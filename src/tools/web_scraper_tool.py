@@ -53,33 +53,63 @@ class WebScraperTool(BaseTool):
         return output or "No results found."
 
     def _scrape_reddit(self, context) -> str:
-        """Scrape Reddit via JSON API - no JS needed."""
+        """Scrape Reddit — navigate into posts, extract content for monetization analysis."""
         lines = []
-        for sub in SUBREDDITS:
+        for sub in ["sidehustle", "Entrepreneur", "passive_income"]:
             try:
                 page = context.new_page()
-                url = f"https://old.reddit.com/r/{sub}/search.json?q=side+hustle+OR+passive+income+OR+monetize&sort=top&t=month"
+                url = f"https://old.reddit.com/r/{sub}/search.json?q=side+hustle+OR+passive+income+OR+make+money&sort=top&t=month&restrict_sr=1"
                 resp = page.goto(url, timeout=20000)
                 page.wait_for_timeout(2000)
                 content = page.content()
                 page.close()
 
-                if resp.status == 200:
-                    soup = BeautifulSoup(content, "html.parser")
-                    posts = soup.select(".link")[:5]
-                    for post in posts:
-                        title_el = post.select_one(".title a, .search-title")
-                        score_el = post.select_one(".score")
-                        link_el = post.select_one(".title a")
-                        if title_el:
-                            title = title_el.get_text(strip=True)
-                            score = score_el.get_text(strip=True) if score_el else "?"
-                            href = link_el.get("href", "") if link_el else ""
-                            lines.append(
-                                f"[Reddit/r/{sub}] {title}\n  Score: {score} | URL: https://reddit.com{href}"
-                            )
-                else:
-                    lines.append(f"[Reddit/r/{sub}] HTTP {resp.status} (blocked)")
+                if resp.status != 200:
+                    lines.append(f"[Reddit/r/{sub}] HTTP {resp.status}")
+                    continue
+
+                soup = BeautifulSoup(content, "html.parser")
+                # Get post links from search results
+                post_links = soup.select(".result a[data-type='Submission']")[:5]
+                if not post_links:
+                    post_links = soup.select(".titleline > a")[:5]
+
+                posts = []
+                for a in post_links:
+                    title = a.get_text(strip=True)
+                    href = a.get("href", "")
+                    if href.startswith("/"):
+                        href = f"https://old.reddit.com{href}"
+                    posts.append({"title": title, "url": href})
+
+                # Filter out non-opportunities
+                filtered = RedditPostParser.filter_opportunities(posts)
+
+                # Navigate into each post to get body
+                for post in filtered[:3]:
+                    page2 = context.new_page()
+                    try:
+                        resp2 = page2.goto(post["url"] + ".json", timeout=20000)
+                        page2.wait_for_timeout(1500)
+                        import json as json_module
+                        data = json_module.loads(page2.content()) if resp2.status == 200 else {}
+                        post_body = ""
+                        if isinstance(data, list) and len(data) > 1:
+                            post_body = data[0].get("data", {}).get("children", [{}])[0].get("data", {}).get("selftext", "")
+                        page2.close()
+
+                        scores = RedditPostParser.score_monetization(post_body)
+                        summary = RedditPostParser.extract_summary(post_body)
+                        income_str = f"€{scores['income']}/mo" if scores['income'] != "?" else "€?/mo"
+                        lines.append(
+                            f"[Reddit/r/{sub}] {post['title']}\n"
+                            f"  Income: {income_str} | Time: {scores['time_hrs_week']} hrs/wk\n"
+                            f"  {summary}\n"
+                            f"  URL: {post['url']}"
+                        )
+                    except Exception:
+                        page2.close()
+                        continue
             except Exception as e:
                 lines.append(f"[Reddit/r/{sub}] Error: {e}")
         return "\n".join(lines) if lines else "[Reddit] Could not reach Reddit"
@@ -348,3 +378,69 @@ class HNHiringParser:
         if "contract" in text.lower() or "freelance" in text.lower():
             return "10"
         return "40"
+
+
+class RedditPostParser:
+    """Parse Reddit posts into structured opportunity records."""
+
+    @staticmethod
+    def filter_opportunities(posts: list[dict]) -> list[dict]:
+        """Remove non-opportunity posts (job listings, meta posts)."""
+        skip_patterns = ["ask hn", "who is hiring", "who wants to be hired",
+                         "monthly thread", "meta discussion"]
+        result = []
+        for post in posts:
+            title_lower = post.get("title", "").lower()
+            if any(p in title_lower for p in skip_patterns):
+                continue
+            result.append(post)
+        return result
+
+    @staticmethod
+    def score_monetization(post_body: str) -> dict:
+        """Score post for monetization signals and estimate income/time."""
+        body_lower = post_body.lower()
+        scores = {
+            "income": "?",
+            "time_hrs_week": "?",
+            "startup_cost": "low",
+        }
+
+        # Income signals
+        if "€" in post_body or "$" in post_body:
+            m = re.search(r'[€$]([\d,]+)', post_body)
+            if m:
+                raw = m.group(1).replace(",", "")
+                try:
+                    monthly = int(raw)
+                    if monthly < 10000:
+                        scores["income"] = str(monthly)
+                    else:
+                        scores["income"] = str(monthly // 12)
+                except ValueError:
+                    pass
+
+        # Time signals
+        if "passive" in body_lower or "automated" in body_lower:
+            scores["time_hrs_week"] = "5"
+        elif "side hustle" in body_lower or "freelance" in body_lower:
+            scores["time_hrs_week"] = "15"
+        else:
+            scores["time_hrs_week"] = "?"
+
+        # Startup cost
+        if any(x in body_lower for x in ["no money", "free", "zero cost", "under €100"]):
+            scores["startup_cost"] = "low"
+        elif any(x in body_lower for x in ["investment", "cost", "expense", "paid"]):
+            scores["startup_cost"] = "medium"
+
+        return scores
+
+    @staticmethod
+    def extract_summary(post_body: str) -> str:
+        """Extract the first meaningful sentence as summary."""
+        lines = [l.strip() for l in post_body.split("\n") if l.strip()]
+        for line in lines:
+            if len(line) > 20:
+                return line[:200]
+        return post_body[:200]
