@@ -95,7 +95,9 @@ class WebScraperTool(BaseTool):
                         data = json_module.loads(page2.content()) if resp2.status == 200 else {}
                         post_body = ""
                         if isinstance(data, list) and len(data) > 1:
-                            post_body = data[0].get("data", {}).get("children", [{}])[0].get("data", {}).get("selftext", "")
+                            children = data[0].get("data", {}).get("children", [])
+                            if children:
+                                post_body = children[0].get("data", {}).get("selftext", "") or ""
                         page2.close()
 
                         scores = RedditPostParser.score_monetization(post_body)
@@ -439,8 +441,10 @@ class RedditPostParser:
     @staticmethod
     def extract_summary(post_body: str) -> str:
         """Extract the first meaningful sentence as summary."""
+        if not post_body:
+            return "[no summary available]"
         lines = [l.strip() for l in post_body.split("\n") if l.strip()]
         for line in lines:
             if len(line) > 20:
                 return line[:200]
-        return post_body[:200]
+        return post_body[:200] if post_body else "[no summary available]"
