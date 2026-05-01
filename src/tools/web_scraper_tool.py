@@ -32,6 +32,9 @@ class WebScraperTool(BaseTool):
                     extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
 
+                # Log into HN if credentials are available
+                self._hn_login(context)
+
                 if source in ("reddit", "all"):
                     results.append(self._scrape_reddit(context))
                 if source in ("indiehackers", "all"):
@@ -51,6 +54,26 @@ class WebScraperTool(BaseTool):
 
         output = "\n\n".join(r for r in results if r)
         return output or "No results found."
+
+    def _hn_login(self, context) -> None:
+        """Log into HN using credentials from environment."""
+        import os
+        username = os.getenv("HN_USERNAME", "")
+        password = os.getenv("HN_PASSWORD", "")
+        if not username or not password:
+            return
+
+        try:
+            page = context.new_page()
+            page.goto("https://news.ycombinator.com/login", timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+            page.fill("input[name='acct']", username)
+            page.fill("input[name='pw']", password)
+            page.click("input[type='submit']")
+            page.wait_for_timeout(2000)
+            page.close()
+        except Exception:
+            pass  # login failure is non-fatal
 
     def _scrape_reddit(self, context) -> str:
         """Scrape Reddit — navigate into posts, extract content for monetization analysis."""
@@ -149,12 +172,15 @@ class WebScraperTool(BaseTool):
             return f"[IndieHackers] Error: {e}"
 
     def _scrape_hackernews(self, context) -> str:
-        """Scrape Hacker News 'Who is hiring' threads — rich source of side hustle ideas."""
+        """Scrape HN front page for side hustle / business opportunities.
+
+        People post income reports, "I built X and make €Y/mo", SaaS launches,
+        freelance wins, etc. Filter OUT job offers and "Ask HN" threads.
+        """
         try:
             page = context.new_page()
-            # HN hiring threads are goldmines for freelance/remote work
             resp = page.goto(
-                "https://news.ycombinator.com/submitted?id=whoishiring",
+                "https://news.ycombinator.com/",
                 timeout=20000,
                 wait_until="domcontentloaded",
             )
@@ -163,22 +189,44 @@ class WebScraperTool(BaseTool):
             page.close()
 
             soup = BeautifulSoup(content, "html.parser")
-            titles = soup.select(".titleline > a")[:8]
+            titles = soup.select(".titleline > a")[:20]
             lines = []
 
             for t in titles:
                 text = t.get_text(strip=True)
                 href = t.get("href", "")
-                # Filter to 'who is hiring' threads (monthly threads contain many opportunities)
-                lines.append(f"[HackerNews] {text}\n  URL: https://news.ycombinator.com/{href}")
+                url = href if href.startswith("http") else f"https://news.ycombinator.com/{href}"
 
-            return "\n".join(lines) if lines else "[HackerNews] No threads found"
+                # Skip job/career threads
+                skip_patterns = ["ask hn: who is hiring", "who wants to be hired",
+                                 "hiring", "job:", "careers", "position:"]
+                if any(p in text.lower() for p in skip_patterns):
+                    continue
 
+                # Check for side hustle signals in the title
+                hustle_patterns = [
+                    "i make", "i earned", "i built", "i launched", "i started",
+                    "my saas", "side hustle", "passive income", "€/mo", "€k",
+                    "$k/mo", "making $", "making €", "revenue", "profit",
+                    "freelance", "consulting", "affiliate", "digital product",
+                    "dropshipping", "print on demand", "monthly income",
+                ]
+                if not any(p in text.lower() for p in hustle_patterns):
+                    # Still include — scrape the linked page to check body
+                    pass
+
+                lines.append(f"[HN] {text}\n  URL: {url}")
+
+            return "\n".join(lines) if lines else "[HN] No opportunities found on front page"
         except Exception as e:
-            return f"[HackerNews] Error: {e}"
+            return f"[HN] Error: {e}"
 
     def _scrape_hn_hiring(self, context) -> str:
-        """Scrape HN 'Who is hiring' monthly threads — rich source of real opportunities."""
+        """Scrape HN 'Who is hiring' for side hustle / business opportunities, not job offers.
+
+        Filters OUT: anything with a company name + job title + location combo (employment).
+        Filters IN: side project income, freelance, SaaS, consulting, digital products, etc.
+        """
         try:
             page = context.new_page()
             resp = page.goto(
@@ -194,13 +242,13 @@ class WebScraperTool(BaseTool):
             links = soup.select(".titleline > a")
             threads = [a for a in links if "who is hiring" in a.get_text(strip=True).lower()][:3]
 
-            all_jobs = []
+            all_opps = []
             for thread_link in threads:
                 thread_title = thread_link.get_text(strip=True)
                 thread_url = thread_link.get("href", "")
-                # Navigate to the thread
-                page2 = context.new_page()
                 target = thread_url if thread_url.startswith("http") else f"https://news.ycombinator.com/{thread_url}"
+
+                page2 = context.new_page()
                 resp2 = page2.goto(target, timeout=25000, wait_until="domcontentloaded")
                 page2.wait_for_timeout(3000)
                 thread_html = page2.content()
@@ -208,12 +256,13 @@ class WebScraperTool(BaseTool):
 
                 jobs = HNHiringParser.parse_job_comments(thread_html)
                 for job in jobs:
-                    job["source"] = f"HN {thread_title}"
-                    job["url"] = target
-                all_jobs.extend(jobs)
+                    if self._is_side_hustle_opportunity(job["description"]):
+                        job["source"] = f"HN {thread_title}"
+                        job["url"] = target
+                        all_opps.append(job)
 
             lines = []
-            for job in all_jobs[:10]:  # max 10
+            for job in all_opps[:10]:
                 income_str = f"${job['income']}/mo" if job["income"] != "?" else "$?/mo"
                 lines.append(
                     f"[HN Hiring] {job['title']}\n"
@@ -221,9 +270,36 @@ class WebScraperTool(BaseTool):
                     f"  {job['description'][:200]}\n"
                     f"  URL: {job['url']}"
                 )
-            return "\n\n".join(lines) if lines else "[HN Hiring] No threads found"
+            return "\n\n".join(lines) if lines else "[HN Hiring] No side hustle opportunities found this month"
         except Exception as e:
             return f"[HN Hiring] Error: {e}"
+
+    @staticmethod
+    def _is_side_hustle_opportunity(text: str) -> bool:
+        """Return True if text describes a side hustle / business opportunity, not a job offer."""
+        if not text:
+            return False
+        lower = text.lower()
+        # Employment signals — these mean it's a job listing, not a side hustle
+        job_signals = [
+            "full-time", "full time", "part-time", "part time", "remote (us)",
+            "san francisco", "new york", "seattle", "los angeles", "austin",
+            "boston", "chicago", "toronto", "on-site", "on site", "hybrid",
+            "|",  # company | location | type pattern
+        ]
+        for sig in job_signals:
+            if sig in lower:
+                return False
+
+        # Side hustle / business signals — these mean it's an opportunity
+        hustle_signals = [
+            "i make", "i built", "i earned", "side hustle", "passive income",
+            "freelance", "consulting", "saas", "affiliate", "digital product",
+            "monthly", "per month", "/mo", "€", "£",
+            "my project", "my site", "my blog", "i started", "i launched",
+            "dropshipping", "print on demand", "side project", "earn extra",
+        ]
+        return any(sig in lower for sig in hustle_signals)
 
     def _scrape_substack(self, context) -> str:
         """Scrape Substack's trending business/money newsletter posts."""
@@ -355,22 +431,41 @@ class HNHiringParser:
 
     @staticmethod
     def _extract_job_title(text: str) -> str | None:
-        """First line or first 80 chars is usually the job title. Returns None if all lines are ≤10 chars."""
+        """First line ≥10 chars that's NOT meta HN discussion is the job title."""
+        # Skip HN meta-discussion lines — these are comments ABOUT the thread, not job posts
+        skip_prefixes = (
+            "there is something up", "thank you for flagging", "this is a classic",
+            "i don't think that product", "what was their citizenship",
+            "you need to get in touch", "i feel all hiring", "ask hn",
+            "against malaria", "hi ", "please reach out", "head of engineering",
+        )
         lines = text.split("\n")
         for line in lines:
             line = line.strip()
-            if len(line) > 10:
-                return line[:80]
+            if len(line) < 10:
+                continue
+            # Guard: skip obvious meta-discussion lines
+            lowered = line.lower()
+            if any(lowered.startswith(p) for p in skip_prefixes):
+                continue
+            # Skip lines that are just URLs or email addresses
+            if lowered.startswith("http") or "@" in lowered and lowered.index("@") < 15:
+                continue
+            return line[:80]
         return None  # explicit fallback — caller guards with `if title:`
 
     @staticmethod
     def _extract_salary(text: str) -> str:
-        """Look for salary mentions like $120k, €80/hr.
-        Note: k-suffix not supported — $50k shows as 50 (limitation, not silent data loss).
+        """Look for salary mentions like $120k, $182k-$272k, €80/hr.
+        Handles ranges by taking the first number and multiplying k-suffix by 1000.
         """
-        m = re.search(r'[€$£](\d+)', text)
+        m = re.search(r'[€$£](\d+)k?', text, re.IGNORECASE)
         if m:
-            return m.group(1)
+            num = int(m.group(1))
+            # k-suffix means thousands
+            if m.group(0).endswith('k') or m.group(0).endswith('K'):
+                num *= 1000
+            return str(num)
         return "?"
 
     @staticmethod
