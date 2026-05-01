@@ -6,6 +6,7 @@ routes findings to Slack.
 """
 
 import os
+import re
 import sys
 import json
 import uuid
@@ -151,14 +152,21 @@ def evaluate_opportunity(raw_text: str) -> list:
 
         description = "\n".join(lines[:3])[:300]
 
-        # Extract URL from lines that contain "URL:"
+        # Extract URL and income/time from HN Hiring output lines
         url = ""
+        income = "?"
+        time_hrs = "?"
         for line in lines:
             if "URL:" in line or "url:" in line or line.startswith("http"):
                 url = line.split("URL:", 1)[-1].split("url:", 1)[-1].strip()
                 if not url and line.startswith("http"):
                     url = line.strip()
-                break
+            m_income = re.search(r'Income:\s*\$?([\d]+)', line)
+            if m_income:
+                income = m_income.group(1)
+            m_time = re.search(r'Time:\s*(\d+)', line)
+            if m_time:
+                time_hrs = m_time.group(1)
 
         opp = {
             "id": str(uuid.uuid4()),
@@ -166,9 +174,9 @@ def evaluate_opportunity(raw_text: str) -> list:
             "description": description,
             "url": url,
             "scores": {
-                "income": "?",
-                "time_hrs_week": "?",
-                "startup_cost": "low",
+                "income": income,
+                "time_hrs_week": time_hrs,
+                "startup_cost": "low" if "remote" in description.lower() else "medium",
                 "skill_match": "medium",
                 "timing": "growing",
             },

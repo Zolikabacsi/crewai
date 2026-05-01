@@ -4,6 +4,7 @@ from crewai.tools import BaseTool
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import re
+import requests
 
 
 SUBREDDITS = ["startups", "Entrepreneur", "sidehustle", "passive_income"]
@@ -37,15 +38,21 @@ class WebScraperTool(BaseTool):
 
                 if source in ("reddit", "all"):
                     results.append(self._scrape_reddit(context))
+                    results.append(self._scrape_sidehustle(context))
                 if source in ("indiehackers", "all"):
                     results.append(self._scrape_indiehackers(context))
                 if source in ("hackernews", "all"):
                     results.append(self._scrape_hackernews(context))
                     results.append(self._scrape_hn_hiring(context))
+                    results.append(self._scrape_hn_algolia(context))
                 if source in ("substack", "all"):
                     results.append(self._scrape_substack(context))
                 if source in ("producthunt", "all"):
                     results.append(self._scrape_producthunt(context))
+                if source in ("fastlane", "all"):
+                    results.append(self._scrape_fastlane(context))
+                if source in ("sidehustleschool", "all"):
+                    results.append(self._scrape_sidehustle_school(context))
 
                 context.close()
                 browser.close()
@@ -56,7 +63,7 @@ class WebScraperTool(BaseTool):
         return output or "No results found."
 
     def _hn_login(self, context) -> None:
-        """Log into HN using credentials from environment."""
+        """Log into HN using credentials from environment. Persists session cookie to context."""
         import os
         username = os.getenv("HN_USERNAME", "")
         password = os.getenv("HN_PASSWORD", "")
@@ -70,7 +77,13 @@ class WebScraperTool(BaseTool):
             page.fill("input[name='acct']", username)
             page.fill("input[name='pw']", password)
             page.click("input[type='submit']")
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
+            # Persist the 'user' cookie to the context so all new pages are logged in
+            cookies = context.cookies()
+            for cookie in cookies:
+                if cookie["name"] == "user":
+                    context.add_cookies([cookie])
+                    break
             page.close()
         except Exception:
             pass  # login failure is non-fatal
@@ -138,6 +151,41 @@ class WebScraperTool(BaseTool):
             except Exception as e:
                 lines.append(f"[Reddit/r/{sub}] Error: {e}")
         return "\n".join(lines) if lines else "[Reddit] Could not reach Reddit"
+
+    def _scrape_sidehustle(self, context) -> str:
+        """Scrape r/sidehustle via HN Algolia for real opportunity posts with content.
+
+        HN Algolia indexes Reddit posts — uses story_text filter to get posts with actual body.
+        """
+        queries = [
+            "site:reddit.com/r/sidehustle side hustle income",
+            "site:reddit.com/r/sidehustle i make €",
+            "site:reddit.com/r/sidehustle monthly income",
+            "site:reddit.com/r/sidehustle service business",
+            "site:reddit.com/r/sidehustle freelance",
+        ]
+        seen = set()
+        results = []
+        for q in queries:
+            try:
+                url = f"https://hn.algolia.com/api/v1/search?query={requests.utils.quote(q)}&tags=story&hitsPerPage=8"
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                for hit in resp.json().get("hits", []):
+                    title = hit.get("title", "")
+                    oid = hit.get("objectID", "")
+                    hit_url = f"https://news.ycombinator.com/item?id={oid}"
+                    if title and title not in seen:
+                        seen.add(title)
+                        results.append({"title": title, "url": hit_url})
+            except Exception:
+                pass
+
+        lines = []
+        for r in results[:5]:
+            lines.append(f"[r/sidehustle] {r['title']}\n  URL: {r['url']}")
+        return "\n".join(lines) if lines else "[r/sidehustle] No posts found"
 
     def _scrape_indiehackers(self, context) -> str:
         """IndieHackers requires login — try the public posts feed as fallback."""
@@ -220,6 +268,196 @@ class WebScraperTool(BaseTool):
             return "\n".join(lines) if lines else "[HN] No opportunities found on front page"
         except Exception as e:
             return f"[HN] Error: {e}"
+
+    def _scrape_hn_algolia(self, context) -> str:
+        """Search HN via Algolia API for side hustle / income report posts.
+
+        Fetches headlines from Algolia, then navigates into each post to extract
+        the top comment that describes actual income / side hustle details.
+        """
+        import json as json_module
+
+        queries = [
+            "passive income",
+            "side hustle",
+            "saas revenue",
+            "make €",
+            "monthly income",
+            "i built my saas",
+            "freelance income",
+        ]
+
+        all_results = []
+        seen_titles = set()
+        for q in queries:
+            try:
+                encoded_q = requests.utils.quote(q)
+                url = f"https://hn.algolia.com/api/v1/search?query={encoded_q}&tags=story&hitsPerPage=10"
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                for hit in data.get("hits", []):
+                    title = hit.get("title", "")
+                    object_id = hit.get("objectID", "")
+                    hit_url = f"https://news.ycombinator.com/item?id={object_id}"
+                    if title and title not in seen_titles:
+                        seen_titles.add(title)
+                        all_results.append({"title": title, "url": hit_url})
+            except Exception:
+                pass
+
+        lines = []
+        for r in all_results[:8]:
+            # Navigate into the post to get the top comments with income details
+            income = "?"
+            time_hrs = "?"
+            description = ""
+            try:
+                page = context.new_page()
+                page.goto(r["url"], timeout=20000, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
+                html = page.content()
+                page.close()
+
+                soup = BeautifulSoup(html, "html.parser")
+                # Get top-level comments (class="comment tree")
+                comments = soup.select(".comment")[:15]
+                for com in comments:
+                    text = com.get_text(strip=True)
+                    if len(text) < 30:
+                        continue
+                    # Look for income signals
+                    inc = self._extract_income_from_text(text)
+                    if inc != "?" and income == "?":
+                        income = inc
+                    # Look for time signals
+                    time_hr = self._extract_time_from_text(text)
+                    if time_hr != "?" and time_hrs == "?":
+                        time_hrs = time_hr
+                    # First meaningful comment becomes the description
+                    if not description and len(text) > 40:
+                        description = text[:200]
+                    if income != "?" and description:
+                        break
+            except Exception:
+                pass
+
+            income_str = f"€{income}/mo" if income != "?" else "€?/mo"
+            lines.append(
+                f"[HN] {r['title']}\n"
+                f"  Income: {income_str} | Time: {time_hrs} hrs/wk\n"
+                f"  {description}\n"
+                f"  URL: {r['url']}"
+            )
+
+        return "\n\n".join(lines) if lines else "[HN Algolia] No results found"
+
+    @staticmethod
+    def _extract_income_from_text(text: str) -> str:
+        """Extract income figure from comment text. Handles €X/mo, $Xk, €Xk."""
+        # €500/mo or €500/month
+        m = re.search(r'€\s*([\d,]+)\s*(?:/mo|/month|mo|per month)', text, re.IGNORECASE)
+        if m:
+            return m.group(1).replace(",", "")
+        # €500k or €500K
+        m = re.search(r'€\s*([\d,]+)\s*k', text, re.IGNORECASE)
+        if m:
+            return str(int(m.group(1).replace(",", "")) * 1000)
+        # $500/mo
+        m = re.search(r'\$\s*([\d,]+)\s*(?:/mo|/month|mo)', text, re.IGNORECASE)
+        if m:
+            return m.group(1).replace(",", "")
+        # $500k
+        m = re.search(r'\$\s*([\d,]+)\s*k', text, re.IGNORECASE)
+        if m:
+            return str(int(m.group(1).replace(",", "")) * 1000)
+        # €500 standalone (assume monthly)
+        m = re.search(r'€\s*([\d,]+)', text)
+        if m:
+            num = int(m.group(1).replace(",", ""))
+            if num > 10000:
+                num = num // 12
+            return str(num)
+        # $500 standalone
+        m = re.search(r'\$\s*([\d,]+)(?![\dk])', text)
+        if m:
+            num = int(m.group(1).replace(",", ""))
+            if num > 10000:
+                num = num // 12
+            return str(num)
+        return "?"
+
+    @staticmethod
+    def _extract_time_from_text(text: str) -> str:
+        """Extract hours-per-week estimate from comment text."""
+        lower = text.lower()
+        if any(x in lower for x in ["20 hrs", "20 hours", "part-time", "part time", "couple hours"]):
+            return "15"
+        if any(x in lower for x in ["few hours", "5 hrs", "5 hours", "1-2 hours", "passive"]):
+            return "5"
+        if any(x in lower for x in ["full-time", "full time", "40 hrs", "40 hours"]):
+            return "40"
+        if any(x in lower for x in ["10 hrs", "10 hours", "side project", "weekend"]):
+            return "10"
+        return "?"
+
+    def _scrape_fastlane(self, context) -> str:
+        """Scrape The Fastlane Forum for side hustle discussions."""
+        try:
+            page = context.new_page()
+            resp = page.goto(
+                "https://www.thefastlaneforum.com/community/tags/side-hustle/",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(3000)
+            content = page.content()
+            page.close()
+
+            soup = BeautifulSoup(content, "html.parser")
+            threads = soup.select(".structItem-title a")[:8]
+            lines = []
+            for t in threads:
+                title = t.get_text(strip=True)
+                href = t.get("href", "")
+                if href and not href.startswith("http"):
+                    href = "https://www.thefastlaneforum.com" + href
+                lines.append(f"[Fastlane] {title}\n  URL: {href}")
+            return "\n".join(lines) if lines else "[Fastlane] No discussions found"
+        except Exception as e:
+            return f"[Fastlane] Error: {e}"
+
+    def _scrape_sidehustle_school(self, context) -> str:
+        """Scrape Side Hustle School ideas page — curated case studies."""
+        try:
+            page = context.new_page()
+            resp = page.goto(
+                "https://sidehustleschool.com/ideas/",
+                timeout=20000,
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(2000)
+            content = page.content()
+            page.close()
+
+            soup = BeautifulSoup(content, "html.parser")
+            items = soup.select(".idea-item, .post, article, .entry")[:10]
+            if not items:
+                items = soup.select("a[href*='/ideas/']")[:10]
+            lines = []
+            for item in items:
+                title_el = item.select_one("h2, h3, .title") or item
+                title = title_el.get_text(strip=True)
+                href = item.get("href") or ""
+                if title and len(title) > 5:
+                    if href and not href.startswith("http"):
+                        href = "https://sidehustleschool.com" + href
+                    lines.append(f"[Side Hustle School] {title}\n  URL: {href}")
+            return "\n".join(lines) if lines else "[Side Hustle School] No ideas found"
+        except Exception as e:
+            return f"[Side Hustle School] Error: {e}"
 
     def _scrape_hn_hiring(self, context) -> str:
         """Scrape HN 'Who is hiring' for side hustle / business opportunities, not job offers.
