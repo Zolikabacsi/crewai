@@ -287,7 +287,7 @@ class WebScraperTool(BaseTool):
 
             for p in posts:
                 title_el = p.select_one("h3, [data-test='post-title'], .feed-item__title")
-                link = p.get("href", "") if isinstance(p, Exception) else ""
+                link = ""
                 if title_el:
                     text = title_el.get_text(strip=True)
                     parent_a = title_el.find_parent("a") if title_el else None

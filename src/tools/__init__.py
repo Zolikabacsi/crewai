@@ -5,6 +5,9 @@ from .email_tool import EmailSearchTool
 from .vault_search_tool import VaultSearchTool
 from .vault_read_tool import VaultReadTool
 from .drive_sync_tool import DriveSyncTool
+from .gws_tool import GWSCommandTool
+from .agent_bus_tool import AgentBusTool
+from .second_brain_tool import SecondBrainKnowledgeTool
 
 # Side Hustle Scout tools
 from .web_scraper_tool import WebScraperTool
@@ -27,6 +30,9 @@ __all__ = [
     "VaultSearchTool",
     "VaultReadTool",
     "DriveSyncTool",
+    "GWSCommandTool",
+    "AgentBusTool",
+    "SecondBrainKnowledgeTool",
     # Scout tools
     "WebScraperTool",
     "IndustryReportTool",

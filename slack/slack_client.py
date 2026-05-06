@@ -27,6 +27,7 @@ class SlackClient:
 
 def build_extraordinary_alert(title: str, description: str, scores: dict,
                                coach_says: str, devils_advocate: str, source: str) -> str:
+    """Deprecated: unused. Kept for backwards compatibility with scripts that import it."""
     lines = [
         "🔔 *EXTRAORDINARY OPPORTUNITY FOUND*",
         "",

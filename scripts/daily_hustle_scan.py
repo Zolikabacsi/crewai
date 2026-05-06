@@ -1,56 +1,443 @@
 #!/usr/bin/env python3
 """Daily side hustle scan — run via cron.
 
-Scrapes web sources, checks vault reports, consults council agents,
-routes findings to Slack.
+Uses Reddit free JSON API (no Playwright), RSS feeds, and direct HTTP.
+No browser automation needed.
 """
 
 import os
 import sys
 import json
 import uuid
+import feedparser
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-# Add project root to path
-WORKTREE_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(WORKTREE_ROOT))
+import requests
 
-from src.tools import WebScraperTool, IndustryReportTool, OpportunityStorageTool
-from src.tools.web_scraper_tool import RedditPostParser
-from slack.slack_client import SlackClient, build_extraordinary_alert, build_daily_report, build_hustle_report
+# Add project root + sibling packages to path.
+# insert(0,...) prepends — last insert ends up FIRST in sys.path (correct search priority).
+WORKTREE_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(WORKTREE_ROOT / "ai_council"))  # 3rd in list → resolved 3rd
+sys.path.insert(0, str(WORKTREE_ROOT / "src"))          # 2nd in list → resolved 2nd
+sys.path.insert(0, str(WORKTREE_ROOT))                   # 1st in list → resolved 1st
+
+from src.tools import OpportunityStorageTool
+from slack.slack_client import SlackClient, build_extraordinary_alert, build_hustle_report
 # ai_council imported lazily in consult_council to avoid loading crewai_tools at module level
 
-OPPORTUNITY_STORE = Path.home() / ".claude" / "side_hustle_opportunities.json"
-VAULT_ROOT = Path.home() / "srv" / "vault"
+# ── Reddit ──────────────────────────────────────────────────────────────────
+REDDIT_SUBREDDITS = [
+    "sidehustle",
+    "Entrepreneur",
+    "passive_income",
+    "startups",
+    "smallbusiness",
+    "freelance",
+    "WorkOnline",
+    "digital_marketing",
+    "ecommerce",
+    "juststart",
+    "SideProject",
+    "FIRE",
+    "financialindependence",
+]
 
-DEDUP_FILE = Path.home() / ".claude" / "hustle_seen_urls.json"
-RETENTION_DAYS = 90
+REDDIT_KEYWORDS = [
+    "side hustle", "extra income", "make money", "earn money",
+    "passive income", "online business", "startup", "build",
+    "launch", "first customer", "freelance", "SaaS", "digital product",
+]
+
+_REDDIT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; HustleScanner/1.0)",
+    "Accept": "application/json",
+}
 
 
-class DedupTracker:
-    """Track seen URLs, skip duplicates within 90-day window."""
+def scrape_reddit_posts(seen_tracker) -> list[dict]:
+    """Fetch hot posts from multiple subreddits via Reddit JSON API."""
+    posts = []
+    for sub in REDDIT_SUBREDDITS:
+        try:
+            url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
+            resp = requests.get(url, headers=_REDDIT_HEADERS, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            children = data.get("data", {}).get("children", [])
+            for child in children:
+                post = child["data"]
+                title = post.get("title", "")
+                body = post.get("selftext", "")
+                score = post.get("score", 0)
+                num_comments = post.get("num_comments", 0)
+                created = post.get("created_utc", 0)
+                url = post.get("url", "")
+                permalink = f"https://reddit.com{post.get('permalink', '')}"
 
-    def __init__(self, state_file: Optional[Path] = None):
-        if state_file is None:
-            self.state_file = DEDUP_FILE
-        else:
-            state_file = Path(state_file)
-            self.state_file = state_file / "dedup.json" if state_file.is_dir() else state_file
-        self._data = self._load()
+                if not seen_tracker.is_new(permalink):
+                    continue
 
-    def _load(self) -> dict:
-        if self.state_file.exists():
+                # Keyword relevance check
+                combined = f"{title} {body}".lower()
+                if not any(kw in combined for kw in REDDIT_KEYWORDS):
+                    continue
+
+                posts.append({
+                    "title": title,
+                    "body": body,
+                    "score": score,
+                    "comments": num_comments,
+                    "subreddit": sub,
+                    "url": permalink,
+                    "created_utc": created,
+                    "source": "reddit",
+                })
+        except Exception as e:
+            print(f"Warning: {type(e).__name__}: {e}")
+            continue
+    return posts
+
+
+# ── RSS feeds ────────────────────────────────────────────────────────────────
+RSS_FEEDS = [
+    {
+        "name": "HackerNews",
+        "url": "https://hnrss.org/newest?q=startup+OR+saas+OR+business+OR+side+hustle+OR+passive+income",
+        "keywords": ["hustle", "revenue", "launch", "income", "startup", "business"],
+    },
+    {
+        "name": "IndieHackers",
+        "url": "https://www.indiehackers.com/feed.xml",
+        "keywords": ["hustle", "revenue", "launch", "income", "build", "started"],
+    },
+    {
+        "name": "ProductHunt",
+        "url": "https://www.producthunt.com/feed",
+        "keywords": ["launch", "product", "free", "tool", "app"],
+    },
+]
+
+
+def scrape_rss_feeds(seen_tracker) -> list[dict]:
+    """Parse RSS feeds for relevant hustle content."""
+    posts = []
+    for feed_cfg in RSS_FEEDS:
+        try:
+            resp = requests.get(
+                feed_cfg["url"],
+                headers={"User-Agent": "Mozilla/5.0 HustleScanner/1.0"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+            feed = feedparser.parse(resp.text)
+            for entry in feed.entries[:20]:
+                title = getattr(entry, "title", "")
+                summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+                link = getattr(entry, "link", "")
+                published = getattr(entry, "published", "")
+
+                # Clean HTML from summary
+                import re
+                summary = re.sub(r"<[^>]+>", " ", summary)
+                summary = re.sub(r"\s+", " ", summary).strip()
+
+                if not seen_tracker.is_new(link):
+                    continue
+
+                combined = f"{title} {summary}".lower()
+                if not any(kw in combined for kw in feed_cfg["keywords"]):
+                    continue
+
+                posts.append({
+                    "title": title,
+                    "body": summary[:500],
+                    "score": 0,
+                    "comments": 0,
+                    "subreddit": feed_cfg["name"],
+                    "url": link,
+                    "created_utc": 0,
+                    "source": "rss",
+                })
+        except Exception as e:
+            print(f"Warning: {type(e).__name__}: {e}")
+            continue
+    return posts
+
+
+# ── Scraper ─────────────────────────────────────────────────────────────────
+def scrape_sources(seen_tracker) -> list[dict]:
+    """Gather opportunities from all sources."""
+    all_posts = []
+
+    reddit_posts = scrape_reddit_posts(seen_tracker)
+    all_posts.extend(reddit_posts)
+
+    rss_posts = scrape_rss_feeds(seen_tracker)
+    all_posts.extend(rss_posts)
+
+    return all_posts
+
+
+# ── Scoring ─────────────────────────────────────────────────────────────────
+SCORE_KEYWORDS_TITLE = [
+    "passive income", "automated", "scale", "profitable", "first paying",
+    "reached $", "make $", "earned $", "$1k", "$10k", "mrp", "monthly",
+]
+
+SCORE_KEYWORDS_BODY = [
+    "passive", "automated", "scalable", "profitable", "customer",
+    "revenue", "income", "earn", "marketplace", "SaaS", "digital product",
+]
+
+TRASH_KEYWORDS = ["ONLYOFFICE", "WTF", "nsfw", "[removed]", "[deleted]"]
+
+
+def score_opportunity(post: dict) -> Optional[float]:
+    """Score a post. Returns None if filtered out as noise."""
+    title = post.get("title", "")
+    body = post.get("body", "")
+    score = post.get("score", 0)
+    source = post.get("source", "reddit")
+
+    if source == "reddit":
+        combined_score = score
+    else:
+        # RSS posts have no vote score — use recency as proxy
+        combined_score = 10
+
+    title_lower = title.lower()
+    body_lower = body.lower()
+
+    # Filter noise
+    if any(kw in title_lower for kw in TRASH_KEYWORDS):
+        return None
+
+    # Engagement filter (reddit)
+    if source == "reddit" and score < 5:
+        return None
+
+    # Keyword scoring
+    pts = 0
+    for kw in SCORE_KEYWORDS_TITLE:
+        if kw in title_lower:
+            pts += 3
+    for kw in SCORE_KEYWORDS_BODY:
+        if kw in body_lower:
+            pts += 1
+
+    # Comments bonus
+    comments = post.get("comments", 0)
+    if comments > 50:
+        pts += 4
+    elif comments > 20:
+        pts += 2
+    elif comments > 5:
+        pts += 1
+
+    # Reddit score bonus
+    if score > 500:
+        pts += 5
+    elif score > 100:
+        pts += 3
+    elif score > 20:
+        pts += 1
+
+    return pts + combined_score * 0.01
+
+
+# ── AI Council ────────────────────────────────────────────────────────────────
+def consult_council_single(opp: dict) -> tuple[str, dict]:
+    """
+    Consult the AI board partners (CMO, CFO, Coach, Devil's Advocate)
+    on a single opportunity. Returns (title, council_text) tuple.
+
+    Graceful fallback: if council fails, returns an error string.
+    """
+    import subprocess, json, os
+    from pathlib import Path
+
+    topic = (
+        f"Evaluate this side hustle:\n\n"
+        f"Title: {opp.get('title', '')}\n"
+        f"Source: {opp.get('source', 'reddit')} ({opp.get('subreddit', '')})\n"
+        f"Body: {opp.get('body', '')[:600]}\n"
+        f"Hustle Score: {opp.get('hustle_score', '?')}\n"
+    )
+
+    partners_prompt = (
+        'You are consulting 4 AI board partners on the following side hustle opportunity.\n'
+        'For each partner, give a focused 2-3 sentence assessment based on their role.\n'
+        'Reply with ONLY a JSON object (no markdown, no code fences):\n\n'
+        '{"CMO": "[market viability, audience fit, GTM path, growth channels]",\n'
+        ' "CFO": "[financial viability, startup costs, income potential, time ROI]",\n'
+        ' "Coach": "[founder fit, time commitment, skill match, mindset risks]",\n'
+        ' "DevilsAdvocate": "[what could go wrong, biggest risks, failure modes]"\n'
+        '}\n\n'
+        'OPPORTUNITY TO EVALUATE:\n'
+        + topic
+    )
+
+    claude_bin = Path.home() / ".local" / "bin" / "claude"
+
+    try:
+        result = subprocess.run(
+            [str(claude_bin), "-p", "--model", "MiniMax-M2.7", "--output-format", "json",
+             partners_prompt],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=90,
+            env={**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_AUTH_TOKEN", "")},
+        )
+
+        if result.returncode == 0 and result.stdout.strip():
             try:
-                return json.loads(self.state_file.read_text())
+                raw = json.loads(result.stdout.strip())
+                text = raw.get("result", raw.get("content", raw.get("text", "")))
+                if isinstance(text, str):
+                    data = json.loads(text)
+                else:
+                    data = text
+                lines = [f"*{role}:* {assessment}" for role, assessment in data.items()]
+                return (opp.get("title", ""), "\n".join(lines))
+            except json.JSONDecodeError:
+                fallback = raw.get("result", "") if isinstance(raw, dict) else str(raw)
+                return (opp.get("title", ""), str(fallback)[:500])
+        else:
+            return (opp.get("title", ""), f"[council error: {result.stderr[:200] if result.stderr else 'no output'}]")
+    except subprocess.TimeoutExpired:
+        return (opp.get("title", ""), "[council timeout]")
+    except Exception as e:
+        return (opp.get("title", ""), f"[council unavailable: {e}]")
+
+
+def consult_council(opp: dict) -> str:
+    """Backward-compatible wrapper — calls single and returns just the opinion."""
+    _, opinion = consult_council_single(opp)
+    return opinion
+
+
+# ── Storage ─────────────────────────────────────────────────────────────────
+def save_opportunity(opp: dict):
+    try:
+        store = OpportunityStorageTool()
+        store._run(action="save", data=json.dumps(opp))
+    except Exception as e:
+        print(f"Storage error: {e}")
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+def main():
+    print(f"[{datetime.now():%H:%M:%S}] Starting hustle scan...")
+
+    seen_tracker = SeenTracker()
+
+    # Scrape
+    print("Scraping sources...")
+    posts = scrape_sources(seen_tracker)
+    print(f"  → {len(posts)} raw posts collected")
+
+    # Score
+    scored = []
+    skip_count = 0
+    for post in posts:
+        s = score_opportunity(post)
+        if s is None:
+            skip_count += 1
+            seen_tracker.mark_seen(post["url"])
+            continue
+        post["hustle_score"] = round(s, 1)
+        scored.append(post)
+        seen_tracker.mark_seen(post["url"])
+
+    scored.sort(key=lambda x: x["hustle_score"], reverse=True)
+    print(f"Found {len(scored)} ranked opportunities ({skip_count} filtered)")
+
+    # Prune old entries and flush pending writes to disk once
+    seen_tracker.prune()
+    seen_tracker.flush()
+
+    # Top 10 only for Slack
+    # Build scores dict and summary for Slack
+    for opp in scored:
+        # Note: income and time_hrs_week are not available from scraper data
+        # The hustle_score is a composite of engagement metrics, not earnings/time
+        opp["scores"] = {
+            "income": "?",
+            "time_hrs_week": "?",
+        }
+        # Extract first meaningful line as summary
+        body = opp.get("body", "")
+        if body:
+            lines = [l.strip() for l in body.split("\n") if l.strip() and len(l.strip()) > 20]
+            opp["summary"] = lines[0][:200] if lines else body[:150]
+        else:
+            opp["summary"] = opp.get("title", "")
+
+    top = scored[:10]
+
+    # Consult board partners on ALL top opportunities — in parallel
+    print(f"Consulting AI board partners on top {len(top)} opportunities (parallel)...")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_opp = {executor.submit(consult_council_single, opp): opp for opp in top}
+        for future in as_completed(future_to_opp):
+            opp = future_to_opp[future]
+            try:
+                title, opinion = future.result()
+                opp["council_feedback"] = {"coach": opinion}
+                print(f"  [done] {title[:60]}")
+            except Exception as e:
+                print(f"  [error] {opp.get('title', '')[:60]}: {e}")
+
+    # Save all
+    for opp in scored:
+        save_opportunity(opp)
+
+    # Slack
+    print("Sending Slack notifications...")
+    hustle_webhook = os.getenv("HUSTLE_WEBHOOK_URL", os.getenv("SLACK_WEBHOOK_URL", ""))
+    if scored:
+        report = build_hustle_report(top, len(scored), skip_count)
+        SlackClient.send(report, webhook_url=hustle_webhook)
+        print(f"Slack: sent {len(top)} opportunities")
+    else:
+        SlackClient.send(
+            f"📊 Side Hustle Report — {datetime.now():%Y-%m-%d}\n\nNo new opportunities today.",
+            webhook_url=hustle_webhook,
+        )
+
+    print("Scan complete.")
+
+
+# ── Seen tracker (inline, no external dependency) ──────────────────────────
+STATE_FILE = Path(__file__).parent.parent / "output" / "hustle_seen.json"
+RETENTION_DAYS = 14
+
+
+class SeenTracker:
+    def __init__(self):
+        self._data = {"seen": []}
+        if STATE_FILE.exists():
+            try:
+                self._data = json.loads(STATE_FILE.read_text())
             except Exception:
                 pass
-        return {"seen": []}
+        self._pending_writes: list[dict] = []
 
     def _save(self):
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(self._data, indent=2))
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(self._data, indent=2))
+
+    def flush(self):
+        """Write all pending entries to disk."""
+        if self._pending_writes:
+            self._data["seen"].extend(self._pending_writes)
+            self._pending_writes = []
+            self._save()
 
     def is_new(self, url: str) -> bool:
         if not url:
@@ -64,210 +451,16 @@ class DedupTracker:
     def mark_seen(self, url: str):
         if not url:
             return
-        self._data["seen"].append({
+        self._pending_writes.append({
             "url": url,
             "seen_date": datetime.now().strftime("%Y-%m-%d"),
         })
-        self._save()
 
     def prune(self):
-        """Remove entries older than RETENTION_DAYS."""
         cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
         self._data["seen"] = [
             e for e in self._data["seen"] if e["seen_date"] >= cutoff
         ]
-        self._save()
-
-
-def run_web_scan() -> list:
-    """Scrape web for opportunities."""
-    scraper = WebScraperTool()
-    result = scraper._run(source="all")
-    return result
-
-
-def run_vault_check() -> str:
-    """Check vault for industry trends."""
-    tool = IndustryReportTool()
-    return tool._run(query="market trend OR revenue OR demand OR opportunity")
-
-
-def consult_council(opportunity: dict) -> dict:
-    """Consult Coach with graceful degradation on failure."""
-    try:
-        from ai_council.src.agents.agents import CoachPartner
-        coach = CoachPartner()
-        prompt = f"""Evaluate this side hustle opportunity:
-
-Title: {opportunity.get('title', '?')}
-Description: {opportunity.get('description', '?')[:200]}
-Income: €{opportunity.get('scores', {}).get('income', '?')}/month
-Time: {opportunity.get('scores', {}).get('time_hrs_week', '?')} hrs/week
-Startup cost: {opportunity.get('scores', {}).get('startup_cost', '?')}
-
-Provide a one-line assessment of viability and one risk to watch."""
-        coach_response = coach.evaluate(prompt)  # real LLM call
-    except Exception:
-        coach_response = None  # graceful fallback — build_rich_card handles None
-    return {"coach": coach_response, "devils_advocate": ""}
-
-
-def evaluate_opportunity(raw_text: str) -> list:
-    """Parse scraped content into opportunity records.
-
-    Format is: "[Source] title\n  description\n  URL: ..."
-    Separated by double newlines (\n\n).
-    """
-    opportunities = []
-    # Split on double newlines (output separator from scraper)
-    sections = raw_text.split("\n\n")
-    for section in sections:
-        if not section.strip() or len(section) < 20:
-            continue
-        lines = section.strip().split("\n")
-        if len(lines) < 1:
-            continue
-
-        # First line is [Source] Title
-        first_line = lines[0]
-        source = ""
-        title = first_line
-
-        if first_line.startswith("["):
-            # Format: [SourceName] Title
-            bracket_end = first_line.find("]")
-            if bracket_end != -1:
-                source = first_line[1:bracket_end]
-                title = first_line[bracket_end + 1 :].strip()
-                # Remove leading bracket artifact
-                if title.startswith("["):
-                    title = title[1:]
-                    bracket_end2 = title.find("]")
-                    if bracket_end2 != -1:
-                        title = title[bracket_end2 + 1 :].strip()
-
-        if not title or len(title) < 5:
-            continue
-
-        description = "\n".join(lines[:3])[:300]
-
-        # Extract URL from lines that contain "URL:"
-        url = ""
-        for line in lines:
-            if "URL:" in line or "url:" in line or line.startswith("http"):
-                url = line.split("URL:", 1)[-1].split("url:", 1)[-1].strip()
-                if not url and line.startswith("http"):
-                    url = line.strip()
-                break
-
-        opp = {
-            "id": str(uuid.uuid4()),
-            "title": title,
-            "description": description,
-            "url": url,
-            "scores": {
-                "income": "?",
-                "time_hrs_week": "?",
-                "startup_cost": "low",
-                "skill_match": "medium",
-                "timing": "growing",
-            },
-            "council_feedback": {},
-            "status": "pending",
-            "discovered_date": datetime.now().strftime("%Y-%m-%d"),
-            "source": source,
-        }
-        opportunities.append(opp)
-    return opportunities
-
-
-def is_extraordinary(opp: dict) -> bool:
-    """Agent judgment: is this an extraordinary opportunity?"""
-    try:
-        income = int(str(opp.get("scores", {}).get("income", "0")).replace("?", "0").replace("€", "").replace(",", ""))
-        time_hrs = int(str(opp.get("scores", {}).get("time_hrs_week", "99")).replace("?", "99").replace("<", "").split("-")[0])
-        startup_cost_str = str(opp.get("scores", {}).get("startup_cost", "high"))
-        startup_cost = 0 if startup_cost_str.lower() in ["low", "none", "€0", "0"] else 500
-
-        # Extraordinary: high income potential + reasonable time + low startup
-        if income >= 500 and time_hrs <= 15 and startup_cost <= 200:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def save_opportunity(opp: dict) -> None:
-    """Save opportunity to JSON store."""
-    OPPORTUNITY_STORE.parent.mkdir(parents=True, exist_ok=True)
-    existing = []
-    if OPPORTUNITY_STORE.exists():
-        try:
-            existing = json.loads(OPPORTUNITY_STORE.read_text())
-        except Exception:
-            existing = []
-    existing.append(opp)
-    OPPORTUNITY_STORE.write_text(json.dumps(existing, indent=2))
-
-
-def main():
-    print(f"=== Side Hustle Daily Scan — {datetime.now().isoformat()} ===")
-
-    # 1. Fetch web
-    print("Scanning web sources...")
-    try:
-        web_results = run_web_scan()
-    except Exception as e:
-        print(f"Web scan failed: {e}")
-        web_results = ""
-
-    # 2. Parse into opportunities
-    opportunities = evaluate_opportunity(web_results)
-    print(f"Found {len(opportunities)} raw opportunities")
-
-    # 3. Deduplicate
-    dedup = DedupTracker()
-    new_opportunities = []
-    skip_count = 0
-    for opp in opportunities:
-        url = opp.get("url", "")
-        if not url or dedup.is_new(url):
-            if url:
-                dedup.mark_seen(url)
-            new_opportunities.append(opp)
-        else:
-            skip_count += 1
-
-    # 4. Score
-    scored = []
-    for opp in new_opportunities:
-        opp["summary"] = (
-            RedditPostParser.extract_summary(opp.get("description", ""))
-            if "Reddit" in opp.get("source", "")
-            else opp.get("description", "")[:150]
-        )
-        scored.append(opp)
-
-    print(f"Found {len(scored)} new opportunities ({skip_count} skipped as duplicates)")
-
-    # 5. Consult council (graceful)
-    for opp in scored:
-        council = consult_council(opp)
-        opp["council_feedback"] = council
-
-    # 6. Save
-    for opp in scored:
-        save_opportunity(opp)
-
-    # 7. Send Slack
-    print("Sending Slack notifications...")
-    if scored:
-        report = build_hustle_report(scored, len(scored), skip_count)
-        SlackClient.send(report)
-    else:
-        SlackClient.send(f"📊 Side Hustle Daily Report — {datetime.now().strftime('%Y-%m-%d')}\n\nNo new opportunities today.")
-
-    print("Scan complete.")
 
 
 if __name__ == "__main__":

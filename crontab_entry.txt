@@ -1,0 +1,5 @@
+# CMO Daemon auto-start crontab entry
+# Install with: crontab crontab_entry.txt
+# Or append to existing: (crontab -l; cat crontab_entry.txt) | crontab -
+
+@reboot cd /home/zoltan/srv/crewai && PYTHONPATH="$(pwd):$(pwd)/src:$(pwd)/ai_council" .venv/bin/python scripts/cmo_daemon.py >> /home/zoltan/logs/cmo_daemon.log 2>&1

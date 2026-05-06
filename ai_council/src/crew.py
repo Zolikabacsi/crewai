@@ -1,116 +1,83 @@
-"""Main crew for AI Council with memory integration."""
+"""Marketing Crew — CMO-led hierarchical crew for Aestas Healthcare."""
 
 import os
-from crewai import Crew
-from .agents import get_core_agents
-from .tasks import (
-    intelligence_task,
-    devils_advocate_task,
-    coach_task,
-    synthesis_task
-)
-from .memory import get_memory_service
+import sys
+from pathlib import Path
 
+# Allow imports from src/ (sibling package at project root)
+# crew.py is at ai_council/src/ → 3 levels up = project root ~/srv/crewai/
+_CREWAI_ROOT = str(Path(__file__).parent.parent.parent)
+if _CREWAI_ROOT not in sys.path:
+    sys.path.insert(0, _CREWAI_ROOT)
 
-def run_council(topic: str, save_to_memory: bool = True) -> Crew:
-    """Run a focused council session on the given topic.
+from crewai import Crew, Task
+from crewai.process import Process
+from .agents import CMOPartner
+from src.agents.seogeo import SEOGEOSpecialist
+from src.agents.social_manager import SocialMediaManager
+from src.agents.copywriter import Copywriter
+from ai_council.src.config import Config
 
-    Args:
-        topic: The business topic to evaluate
-        save_to_memory: Whether to save results to memory service
+def _setup_llm_env():
+    if Config.ANTHROPIC_AUTH_TOKEN:
+        os.environ["ANTHROPIC_API_KEY"] = Config.ANTHROPIC_AUTH_TOKEN
+    if Config.ANTHROPIC_BASE_URL:
+        os.environ["ANTHROPIC_BASE_URL"] = Config.ANTHROPIC_BASE_URL.rstrip("/v1")
+
+class MarketingCrew:
+    """CMO-led hierarchical crew for Aestas Healthcare marketing.
+    
+    CMO (manager) → delegates to → SEOGEOSpecialist, SocialMediaManager, Copywriter
+    Sub-agents → execute with marketingskills → return outputs
+    CMO → synthesizes → final deliverable
     """
-    # Check memory service availability
-    memory = get_memory_service()
-    memory_available = memory.health_check() if os.environ.get("DISABLE_MEMORY") != "true" else False
+    
+    def __init__(self):
+        _setup_llm_env()
+        self.cmo = CMOPartner()
+        self.seogeo = SEOGEOSpecialist()
+        self.social = SocialMediaManager()
+        self.copywriter = Copywriter()
+    
+    def kickoff(self, task: str) -> str:
+        cmo_task = Task(
+            description=f"""CMO LEADING: {task}
 
-    # Get previous council context if available
-    previous_councils = []
-    if memory_available:
-        try:
-            previous_councils = memory.get_previous_councils(limit=3)
-        except:
-            pass
+SKILL ROUTING — ALWAYS follow this flow:
+1. LOAD relevant marketingskills first via SkillLoaderTool:
+   - SEO/keywords → ai-seo + content-strategy
+   - Social posts → social-content + copywriting
+   - Landing/copy pages → copywriting + page-cro
+   - Email sequences → cold-email + email-sequence
+   - Competitor analysis → competitor-profiling
+   - CRO/forms/popups → form-cro + popup-cro + signup-flow-cro
+   - Analytics/tracking → analytics-tracking
+   - A/B testing → ab-test-setup
 
-    # Build context string from previous councils
-    context_note = ""
-    if previous_councils:
-        context_note = "\n\n## Previous Council Sessions (for continuity)\n"
-        for council in previous_councils[:2]:
-            context_note += f"- {council.get('metadata', {}).get('topic', council.get('content', '')[:100])}...\n"
+2. DELEGATE to the right sub-agent:
+   - SEOGEOSpecialist → keyword research, content briefs, SEO optimization
+   - SocialMediaManager → content calendars, post writing, platform strategy, Zernio posting
+   - Copywriter → all written content, drafts, editing, copy variations
 
-    # Add context to topic
-    enhanced_topic = topic + context_note
+3. COLLECT outputs from sub-agents
 
-    # Create tasks
-    intel_task = intelligence_task(enhanced_topic)
-    da_task = devils_advocate_task(enhanced_topic, context=[intel_task])
-    coach_t = coach_task(enhanced_topic, context=[intel_task, da_task])
-    synthesis = synthesis_task(context=[intel_task, da_task, coach_t])
+4. SYNTHESIZE into the final deliverable
 
-    crew = Crew(
-        agents=get_core_agents(),
-        tasks=[intel_task, da_task, coach_t, synthesis],
-        verbose=True,
-    )
+For simple tasks (single post, quick copy): produce directly using loaded skills.
+For complex tasks (multi-channel campaigns): delegate to sub-agents, then synthesize.""",
+            agent=self.cmo,
+            expected_output="Final marketing deliverable",
+        )
+        
+        crew = Crew(
+            agents=[self.cmo, self.seogeo, self.social, self.copywriter],
+            tasks=[cmo_task],
+            process=Process.hierarchical,
+            manager_agent=self.cmo,
+            verbose=Config.VERBOSE,
+        )
+        return crew.kickoff()
 
-    # Attach memory service to crew for post-execution saving
-    crew.memory_service = memory if memory_available else None
-    crew.topic = topic
-
-    return crew
-
-
-def execute_council_with_memory(topic: str) -> dict:
-    """Execute council and save results to memory.
-
-    Returns:
-        dict with 'result', 'task_outputs', and 'memory_id' if saved
-    """
-    crew = run_council(topic, save_to_memory=True)
-
-    print(f"🎯 Starting AI Council session on: {topic}")
-    if crew.memory_service:
-        print("📝 Memory service connected - results will be saved")
-    print("=" * 60)
-
-    result = crew.kickoff()
-
-    # Extract outputs
-    outputs = {}
-    for task in crew.tasks:
-        outputs[task.description.split('\n')[0][:80]] = task.output
-
-    # Save to memory if available
-    memory_id = None
-    if crew.memory_service:
-        try:
-            # Generate recommendation from synthesis output
-            recommendation = str(result)[:500] if result else ""
-            memory_resp = crew.memory_service.save_council_result(
-                topic=topic,
-                result=str(result),
-                agents=[a.role for a in crew.agents],
-                recommendation=recommendation
-            )
-            memory_id = memory_resp.get("id")
-            print(f"💾 Saved to memory: {memory_id}")
-        except Exception as e:
-            print(f"⚠️ Memory save failed: {e}")
-
-    return {
-        "result": result,
-        "task_outputs": outputs,
-        "memory_id": memory_id
-    }
-
-
-def run_full_board(topic: str, agents: list, tasks: list) -> Crew:
-    """Run a full board meeting with custom agents and tasks."""
-    crew = Crew(
-        agents=agents,
-        tasks=tasks,
-        verbose=True,
-        process="hierarchical"
-    )
-    crew.topic = topic
-    return crew
+def run_marketing_task(task: str) -> str:
+    """One-shot marketing task through CMO-led crew."""
+    return MarketingCrew().kickoff(task)

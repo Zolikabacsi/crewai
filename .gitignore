@@ -1,5 +1,5 @@
 .venv/
-.env
+.env*
 __pycache__/
 *.pyc
 *.pyo
@@ -15,4 +15,9 @@ output/
 .vault_root/
 node_modules/
 .latexmk_cache/
+.marketingskills/
+marketingskills/
+*.pdf
+*.bin
+*.db
 .venv/

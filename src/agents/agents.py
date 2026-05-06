@@ -12,20 +12,22 @@ from crewai.llm import LLM
 from crewai_tools import DirectoryReadTool, FileReadTool
 from ..config import Config
 
+import os
+
 # Ensure environment is configured for custom endpoints
-if Config.ANTHROPIC_AUTH_TOKEN and Config.ANTHROPIC_BASE_URL:
-    import os
+if Config.ANTHROPIC_AUTH_TOKEN:
     os.environ["ANTHROPIC_API_KEY"] = Config.ANTHROPIC_AUTH_TOKEN
-    os.environ["ANTHROPIC_BASE_URL"] = Config.ANTHROPIC_BASE_URL
+if Config.ANTHROPIC_BASE_URL:
+    os.environ["ANTHROPIC_BASE_URL"] = Config.ANTHROPIC_BASE_URL.rstrip("/v1")
 
 
 def get_llm():
-    """Create LLM instance for agents with MiniMax-M2.7 model."""
+    """Create LLM instance for agents with MiniMax-M2.7 model via Anthropic endpoint."""
     return LLM(
         provider="anthropic",
         model="MiniMax-M2.7",
         api_key=Config.ANTHROPIC_AUTH_TOKEN,
-        base_url=Config.ANTHROPIC_BASE_URL,
+        base_url=Config.ANTHROPIC_BASE_URL.rstrip("/v1") if Config.ANTHROPIC_BASE_URL else "https://chat.ultimateai.org",
     )
 
 

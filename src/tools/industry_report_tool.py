@@ -63,7 +63,7 @@ class OpportunityStorageTool(BaseTool):
         elif action == "save":
             import uuid
             from datetime import datetime
-            record = json.loads(data) if data.startswith("{") else {"title": data}
+            record = json.loads(data) if data.startswith("{") or data.startswith("[") else {"title": data}
             record["id"] = str(uuid.uuid4())
             record["discovered_date"] = datetime.now().strftime("%Y-%m-%d")
             record["status"] = "pending"

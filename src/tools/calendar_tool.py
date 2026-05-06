@@ -11,7 +11,7 @@ from typing import Optional
 def _run_gws(args: list) -> dict:
     """Run gws command and return parsed JSON."""
     result = subprocess.run(
-        ["~/bin/gws"] + args,
+        ["/home/zoltan/bin/gws"] + args,
         capture_output=True,
         text=True,
         timeout=30,

@@ -14,7 +14,7 @@ DRIVE_FOLDER = "Aestas Group/Aestras Healthcare Ltd"
 
 def _run_gws(args: list) -> dict:
     result = subprocess.run(
-        ["~/bin/gws"] + args,
+        ["/home/zoltan/bin/gws"] + args,
         capture_output=True,
         text=True,
         timeout=60,
