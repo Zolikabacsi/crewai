@@ -1,0 +1,8 @@
+services:
+  crypto-research-agent:
+    build: .
+    container_name: crypto-research-agent
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: ["python", "scripts/daily_crypto_research.py"]
